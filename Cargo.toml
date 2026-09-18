@@ -1,0 +1,15 @@
+[package]
+name = "nonblock-ring-queue"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Rust port of the C nonblocking ring queue"
+publish = false
+
+[lib]
+name = "nonblock_ring_queue"
+path = "src/lib.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
