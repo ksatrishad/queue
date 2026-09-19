@@ -282,9 +282,16 @@ pub fn Release_RingQueueWorker(pstQW: pst_QueueWorker<'_>) {
 pub fn llAcquire_RingQueue(pstRQ: &st_RingQueue, pstQW: &pst_QueueWorker<'_>, ullLen: u64) -> i64 {
     let pstQW = pstQW.pstQW();
 
-    debug_assert!(ullLen > 0 && ullLen <= pstRQ.ullBufLen);
+    assert!(
+        (1..=pstRQ.ullBufLen).contains(&ullLen),
+        "ullLen must be in 1..=ullBufLen"
+    );
     debug_assert_eq!(pstQW.isActive.load(Ordering::Acquire), QUEUE_WORKER_ACTIVE);
-    debug_assert_eq!(pstQW.ullOffReady.load(Ordering::Acquire), RBUF_OFF_MAX);
+    assert_eq!(
+        pstQW.ullOffReady.load(Ordering::Acquire),
+        RBUF_OFF_MAX,
+        "worker already has an unfinished reservation"
+    );
 
     let mut ullReadyPos: u64;
     let mut ullWritePos: u64;
@@ -453,7 +460,6 @@ pub unsafe fn Release_RingQueue(pstRQ: &st_RingQueue, ullReaded: u64) {
     let mut ullReadPos = pstRQ.ullReadPos.load(Ordering::Acquire);
 
     debug_assert!(ullReadPos <= pstRQ.ullBufLen);
-    debug_assert!(ullReadPos <= pstRQ.ullWrapLimit_load());
 
     ullReadPos += ullReaded;
     debug_assert!(ullReadPos <= pstRQ.ullBufLen);

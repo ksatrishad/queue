@@ -106,6 +106,57 @@ fn wraps_at_buffer_end() {
 }
 
 #[test]
+fn exact_end_reservation_wraps_write_position_to_zero() {
+    let pstRQ = pstInit_RingQueue(1, 16).unwrap();
+    let pstQW = pstGet_RingQueueWorker(&pstRQ, 0);
+
+    let first = [0x11u8; 10];
+    let first_pos = llAcquire_RingQueue(&pstRQ, &pstQW, first.len() as u64);
+    assert_eq!(first_pos, 0);
+    unsafe {
+        write_bytes(&pstRQ, first_pos as u64, &first);
+    }
+    Produce_RingQueue(&pstQW);
+
+    let mut ullWriteLen = 0;
+    let first_read = unsafe { llConsume_RingQueue(&pstRQ, &mut ullWriteLen) };
+    assert_eq!(first_read, 0);
+    assert_eq!(ullWriteLen, 10);
+    unsafe { Release_RingQueue(&pstRQ, ullWriteLen) };
+
+    let exact_end = [0x22u8; 6];
+    let exact_end_pos = llAcquire_RingQueue(&pstRQ, &pstQW, exact_end.len() as u64);
+    assert_eq!(exact_end_pos, 10);
+    unsafe {
+        write_bytes(&pstRQ, exact_end_pos as u64, &exact_end);
+    }
+    Produce_RingQueue(&pstQW);
+
+    let exact_end_read = unsafe { llConsume_RingQueue(&pstRQ, &mut ullWriteLen) };
+    assert_eq!(exact_end_read, 10);
+    assert_eq!(ullWriteLen, 6);
+
+    let mut out = [0u8; 6];
+    unsafe {
+        read_bytes(&pstRQ, exact_end_read as u64, &mut out);
+    }
+    assert_eq!(out, exact_end);
+
+    unsafe { Release_RingQueue(&pstRQ, ullWriteLen) };
+    assert_eq!(unsafe { llConsume_RingQueue(&pstRQ, &mut ullWriteLen) }, -1);
+
+    let head = [0x33u8; 4];
+    let head_pos = llAcquire_RingQueue(&pstRQ, &pstQW, head.len() as u64);
+    assert_eq!(head_pos, 0);
+    unsafe {
+        write_bytes(&pstRQ, head_pos as u64, &head);
+    }
+    Produce_RingQueue(&pstQW);
+
+    Release_RingQueueWorker(pstQW);
+}
+
+#[test]
 fn unfinished_earlier_worker_blocks_later_ready_bytes() {
     let pstRQ = pstInit_RingQueue(2, 64).unwrap();
     let pstQW0 = pstGet_RingQueueWorker(&pstRQ, 0);
@@ -239,6 +290,34 @@ fn same_worker_cannot_be_acquired_twice() {
     let pstRQ = pstInit_RingQueue(1, 64).unwrap();
     let _pstQW0 = pstGet_RingQueueWorker(&pstRQ, 0);
     let _pstQW1 = pstGet_RingQueueWorker(&pstRQ, 0);
+}
+
+#[test]
+#[should_panic(expected = "worker already has an unfinished reservation")]
+fn same_worker_must_publish_before_next_acquire() {
+    let pstRQ = pstInit_RingQueue(1, 64).unwrap();
+    let pstQW = pstGet_RingQueueWorker(&pstRQ, 0);
+
+    assert_eq!(llAcquire_RingQueue(&pstRQ, &pstQW, 4), 0);
+    let _ = llAcquire_RingQueue(&pstRQ, &pstQW, 4);
+}
+
+#[test]
+#[should_panic(expected = "ullLen must be in 1..=ullBufLen")]
+fn zero_length_reservation_is_rejected() {
+    let pstRQ = pstInit_RingQueue(1, 64).unwrap();
+    let pstQW = pstGet_RingQueueWorker(&pstRQ, 0);
+
+    let _ = llAcquire_RingQueue(&pstRQ, &pstQW, 0);
+}
+
+#[test]
+#[should_panic(expected = "ullLen must be in 1..=ullBufLen")]
+fn oversized_reservation_is_rejected() {
+    let pstRQ = pstInit_RingQueue(1, 64).unwrap();
+    let pstQW = pstGet_RingQueueWorker(&pstRQ, 0);
+
+    let _ = llAcquire_RingQueue(&pstRQ, &pstQW, 65);
 }
 
 #[test]
