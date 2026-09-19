@@ -40,13 +40,13 @@ fn basic_single_worker_roundtrip() {
     let pstQW = pstGet_RingQueueWorker(&pstRQ, 0);
 
     let payload = b"hello";
-    let ullWritePos = llAcquire_RingQueue(&pstRQ, pstQW, payload.len() as u64);
+    let ullWritePos = llAcquire_RingQueue(&pstRQ, &pstQW, payload.len() as u64);
     assert_eq!(ullWritePos, 0);
 
     unsafe {
         write_bytes(&pstRQ, ullWritePos as u64, payload);
     }
-    Produce_RingQueue(pstQW);
+    Produce_RingQueue(&pstQW);
 
     let mut ullWriteLen = 0;
     let ullReadPos = unsafe { llConsume_RingQueue(&pstRQ, &mut ullWriteLen) };
@@ -70,12 +70,12 @@ fn wraps_at_buffer_end() {
     let pstQW = pstGet_RingQueueWorker(&pstRQ, 0);
 
     let first = [0x11u8; 10];
-    let first_pos = llAcquire_RingQueue(&pstRQ, pstQW, first.len() as u64);
+    let first_pos = llAcquire_RingQueue(&pstRQ, &pstQW, first.len() as u64);
     assert_eq!(first_pos, 0);
     unsafe {
         write_bytes(&pstRQ, first_pos as u64, &first);
     }
-    Produce_RingQueue(pstQW);
+    Produce_RingQueue(&pstQW);
 
     let mut ullWriteLen = 0;
     let first_read = unsafe { llConsume_RingQueue(&pstRQ, &mut ullWriteLen) };
@@ -84,12 +84,12 @@ fn wraps_at_buffer_end() {
     unsafe { Release_RingQueue(&pstRQ, ullWriteLen) };
 
     let second = [0x22u8; 8];
-    let second_pos = llAcquire_RingQueue(&pstRQ, pstQW, second.len() as u64);
+    let second_pos = llAcquire_RingQueue(&pstRQ, &pstQW, second.len() as u64);
     assert_eq!(second_pos, 0);
     unsafe {
         write_bytes(&pstRQ, second_pos as u64, &second);
     }
-    Produce_RingQueue(pstQW);
+    Produce_RingQueue(&pstQW);
 
     let second_read = unsafe { llConsume_RingQueue(&pstRQ, &mut ullWriteLen) };
     assert_eq!(second_read, 0);
@@ -111,15 +111,15 @@ fn unfinished_earlier_worker_blocks_later_ready_bytes() {
     let pstQW0 = pstGet_RingQueueWorker(&pstRQ, 0);
     let pstQW1 = pstGet_RingQueueWorker(&pstRQ, 1);
 
-    let pos0 = llAcquire_RingQueue(&pstRQ, pstQW0, 4);
-    let pos1 = llAcquire_RingQueue(&pstRQ, pstQW1, 4);
+    let pos0 = llAcquire_RingQueue(&pstRQ, &pstQW0, 4);
+    let pos1 = llAcquire_RingQueue(&pstRQ, &pstQW1, 4);
     assert_eq!(pos0, 0);
     assert_eq!(pos1, 4);
 
     unsafe {
         write_bytes(&pstRQ, pos1 as u64, b"BBBB");
     }
-    Produce_RingQueue(pstQW1);
+    Produce_RingQueue(&pstQW1);
 
     let mut ullWriteLen = 99;
     let ullReadPos = unsafe { llConsume_RingQueue(&pstRQ, &mut ullWriteLen) };
@@ -129,7 +129,7 @@ fn unfinished_earlier_worker_blocks_later_ready_bytes() {
     unsafe {
         write_bytes(&pstRQ, pos0 as u64, b"AAAA");
     }
-    Produce_RingQueue(pstQW0);
+    Produce_RingQueue(&pstQW0);
 
     let ullReadPos = unsafe { llConsume_RingQueue(&pstRQ, &mut ullWriteLen) };
     assert_eq!(ullReadPos, 0);
@@ -168,7 +168,7 @@ fn multi_producer_single_consumer_smoke() {
                 let bytes = value.to_le_bytes();
 
                 loop {
-                    let ullWritePos = llAcquire_RingQueue(&pstRQ, pstQW, RECORD_SIZE);
+                    let ullWritePos = llAcquire_RingQueue(&pstRQ, &pstQW, RECORD_SIZE);
                     if ullWritePos < 0 {
                         thread::yield_now();
                         continue;
@@ -177,7 +177,7 @@ fn multi_producer_single_consumer_smoke() {
                     unsafe {
                         write_bytes(&pstRQ, ullWritePos as u64, &bytes);
                     }
-                    Produce_RingQueue(pstQW);
+                    Produce_RingQueue(&pstQW);
                     break;
                 }
             }
@@ -195,7 +195,10 @@ fn multi_producer_single_consumer_smoke() {
     let deadline = Instant::now() + Duration::from_secs(30);
 
     while seen.len() < expected as usize {
-        assert!(Instant::now() < deadline, "multi-producer smoke test timed out");
+        assert!(
+            Instant::now() < deadline,
+            "multi-producer smoke test timed out"
+        );
         let mut ullWriteLen = 0;
         let ullReadPos = unsafe { llConsume_RingQueue(&pstRQ, &mut ullWriteLen) };
 
@@ -228,6 +231,14 @@ fn multi_producer_single_consumer_smoke() {
     }
 
     assert_eq!(seen.len(), expected as usize);
+}
+
+#[test]
+#[should_panic(expected = "each worker slot may be owned by only one producer at a time")]
+fn same_worker_cannot_be_acquired_twice() {
+    let pstRQ = pstInit_RingQueue(1, 64).unwrap();
+    let _pstQW0 = pstGet_RingQueueWorker(&pstRQ, 0);
+    let _pstQW1 = pstGet_RingQueueWorker(&pstRQ, 0);
 }
 
 #[test]

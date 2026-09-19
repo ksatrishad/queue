@@ -1,7 +1,8 @@
 use std::alloc::{alloc, dealloc, Layout};
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt;
 use std::hint::spin_loop;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
@@ -12,11 +13,15 @@ pub const DEF_RING_QUEUE_SIZE: usize = 10 * 1024 * 1024;
 
 const RBUF_OFF_MASK: u64 = 0x0000_0000_ffff_ffff;
 const WRAP_LOCK_BIT: u64 = 0x8000_0000_0000_0000;
-const RBUF_OFF_MAX: u64 = u64::MAX & !WRAP_LOCK_BIT;
+const RBUF_OFF_MAX: u64 = !WRAP_LOCK_BIT;
 
 const WRAP_COUNTER: u64 = 0x7fff_ffff_0000_0000;
 const SPIN_BACKOFF_MIN: u32 = 4;
 const SPIN_BACKOFF_MAX: u32 = 128;
+
+const QUEUE_WORKER_INACTIVE: i32 = 0;
+const QUEUE_WORKER_ACTIVE: i32 = 1;
+const QUEUE_WORKER_CLAIMING: i32 = 2;
 
 #[inline]
 fn WRAP_INCR(x: u64) -> u64 {
@@ -107,7 +112,23 @@ impl Drop for st_RingQueue {
 }
 
 pub type pst_RingQueue = Box<st_RingQueue>;
-pub type pst_QueueWorker<'a> = &'a st_QueueWorker;
+
+/// Exclusive producer-side handle for one `st_QueueWorker` slot.
+///
+/// The handle is movable to another thread but intentionally not `Sync`, so safe
+/// Rust cannot share one acquired worker between concurrent producers.
+#[must_use = "an acquired queue worker must be released with Release_RingQueueWorker"]
+pub struct pst_QueueWorker<'a> {
+    pstQW: &'a st_QueueWorker,
+    _notSync: PhantomData<Cell<()>>,
+}
+
+impl pst_QueueWorker<'_> {
+    #[inline]
+    fn pstQW(&self) -> &st_QueueWorker {
+        self.pstQW
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RingQueueError {
@@ -169,10 +190,7 @@ impl st_RingQueue {
     }
 }
 
-pub fn pstInit_RingQueue(
-    dNumWorker: i32,
-    llLength: i64,
-) -> Result<pst_RingQueue, RingQueueError> {
+pub fn pstInit_RingQueue(dNumWorker: i32, llLength: i64) -> Result<pst_RingQueue, RingQueueError> {
     // The C implementation assumes a non-negative worker count and positive
     // buffer length. Rust rejects invalid values instead of allowing an integer
     // conversion to turn them into a huge allocation.
@@ -220,20 +238,33 @@ pub fn pstGet_RingQueueWorker(pstRQ: &st_RingQueue, dIndex: i32) -> pst_QueueWor
     let dIndex = usize::try_from(dIndex).expect("dIndex must be non-negative");
     let pstQW = &pstRQ.stWorker[dIndex];
 
-    debug_assert_eq!(
-        pstQW.isActive.load(Ordering::Acquire),
-        0,
+    assert!(
+        pstQW
+            .isActive
+            .compare_exchange(
+                QUEUE_WORKER_INACTIVE,
+                QUEUE_WORKER_CLAIMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok(),
         "each worker slot may be owned by only one producer at a time"
     );
 
-    // `pstQW->ullOffReady = RBUF_OFF_MAX` is an atomic assignment in C11, hence
-    // sequentially consistent. Keep that property before publishing isActive.
+    // CLAIMING is invisible to the consumer. Initialize ullOffReady completely
+    // before publishing the ACTIVE state.
     pstQW.ullOffReady.store(RBUF_OFF_MAX, Ordering::SeqCst);
-    pstQW.isActive.store(1, Ordering::Release);
-    pstQW
+    pstQW.isActive.store(QUEUE_WORKER_ACTIVE, Ordering::Release);
+
+    pst_QueueWorker {
+        pstQW,
+        _notSync: PhantomData,
+    }
 }
 
-pub fn Release_RingQueueWorker(pstQW: &st_QueueWorker) {
+pub fn Release_RingQueueWorker(pstQW: pst_QueueWorker<'_>) {
+    let pstQW = pstQW.pstQW();
+
     assert_eq!(
         pstQW.ullOffReady.load(Ordering::Acquire),
         RBUF_OFF_MAX,
@@ -243,15 +274,16 @@ pub fn Release_RingQueueWorker(pstQW: &st_QueueWorker) {
     // Stronger than the C source's Relaxed store. If the consumer observes the
     // inactive state and therefore skips ullOffReady, this Release/Acquire pair
     // still publishes every payload write completed before worker release.
-    pstQW.isActive.store(0, Ordering::Release);
+    pstQW
+        .isActive
+        .store(QUEUE_WORKER_INACTIVE, Ordering::Release);
 }
 
-pub fn llAcquire_RingQueue(
-    pstRQ: &st_RingQueue,
-    pstQW: &st_QueueWorker,
-    ullLen: u64,
-) -> i64 {
+pub fn llAcquire_RingQueue(pstRQ: &st_RingQueue, pstQW: &pst_QueueWorker<'_>, ullLen: u64) -> i64 {
+    let pstQW = pstQW.pstQW();
+
     debug_assert!(ullLen > 0 && ullLen <= pstRQ.ullBufLen);
+    debug_assert_eq!(pstQW.isActive.load(Ordering::Acquire), QUEUE_WORKER_ACTIVE);
     debug_assert_eq!(pstQW.ullOffReady.load(Ordering::Acquire), RBUF_OFF_MAX);
 
     let mut ullReadyPos: u64;
@@ -332,8 +364,10 @@ pub fn llAcquire_RingQueue(
     ullWritePos as i64
 }
 
-pub fn Produce_RingQueue(pstQW: &st_QueueWorker) {
-    debug_assert_ne!(pstQW.isActive.load(Ordering::Acquire), 0);
+pub fn Produce_RingQueue(pstQW: &pst_QueueWorker<'_>) {
+    let pstQW = pstQW.pstQW();
+
+    debug_assert_eq!(pstQW.isActive.load(Ordering::Acquire), QUEUE_WORKER_ACTIVE);
     debug_assert_ne!(pstQW.ullOffReady.load(Ordering::Acquire), RBUF_OFF_MAX);
 
     // Producer payload writes happen-before a consumer that observes this
@@ -367,7 +401,7 @@ pub unsafe fn llConsume_RingQueue(pstRQ: &st_RingQueue, pullWriteLen: &mut u64) 
         for i in 0..(pstRQ.dNumWorker as usize) {
             let pstQW = &pstRQ.stWorker[i];
 
-            if pstQW.isActive.load(Ordering::Acquire) == 0 {
+            if pstQW.isActive.load(Ordering::Acquire) != QUEUE_WORKER_ACTIVE {
                 continue;
             }
 
