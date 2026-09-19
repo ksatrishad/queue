@@ -1,6 +1,8 @@
+use std::alloc::{alloc, dealloc, Layout};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::hint::spin_loop;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 #[cfg(not(target_has_atomic = "64"))]
@@ -67,13 +69,14 @@ impl st_QueueWorker {
 
 /// Rust counterpart of `st_RingQueue` from `libthread.h`.
 ///
-/// C uses `char *pszBuf` plus a flexible-array member `stWorker[]`. Rust owns the
-/// same two allocations as boxed slices. `ullWrapLimit` intentionally remains
-/// non-atomic, as in the C header; accesses are ordered by the queue's
-/// `WRAP_LOCK_BIT` / `ullWritePos` and `ullReadPos` protocol.
+/// C uses `char *pszBuf` plus a flexible-array member `stWorker[]`. Rust keeps
+/// `pszBuf` as a separately owned raw allocation and owns `stWorker[]` as a boxed
+/// slice. `ullWrapLimit` intentionally remains non-atomic, as in the C header;
+/// accesses are ordered by the queue's `WRAP_LOCK_BIT` / `ullWritePos` and
+/// `ullReadPos` protocol.
 pub struct st_RingQueue {
     ullBufLen: u64,
-    pszBuf: Box<[UnsafeCell<u8>]>,
+    pszBuf: NonNull<u8>,
     ullWritePos: AtomicU64,
     ullWrapLimit: UnsafeCell<u64>,
     ullReadPos: AtomicU64,
@@ -81,10 +84,27 @@ pub struct st_RingQueue {
     stWorker: Box<[st_QueueWorker]>,
 }
 
-// The original algorithm deliberately shares the buffer and ullWrapLimit between
-// threads. Atomics establish reservation/publication order; raw payload access is
-// exposed only through the unsafe pszBuf_ptr() API below.
+// SAFETY: The original algorithm deliberately shares the raw payload allocation and
+// ullWrapLimit between threads. Producer reservations are serialized by ullWritePos;
+// payload publication uses ullOffReady; ullWrapLimit is accessed only through the
+// wrap-lock/read-position protocol. Consumer-side functions that require the C
+// single-consumer contract are unsafe so safe Rust cannot create concurrent
+// consumers of this non-atomic state.
+unsafe impl Send for st_RingQueue {}
 unsafe impl Sync for st_RingQueue {}
+
+impl Drop for st_RingQueue {
+    fn drop(&mut self) {
+        let layout = Layout::array::<u8>(self.ullBufLen as usize)
+            .expect("validated ring queue buffer layout");
+
+        // SAFETY: pszBuf was allocated with this exact layout in pstInit_RingQueue
+        // and is owned by this st_RingQueue until drop.
+        unsafe {
+            dealloc(self.pszBuf.as_ptr(), layout);
+        }
+    }
+}
 
 pub type pst_RingQueue = Box<st_RingQueue>;
 pub type pst_QueueWorker<'a> = &'a st_QueueWorker;
@@ -145,7 +165,7 @@ impl st_RingQueue {
     ///   `Release_RingQueue`;
     /// - no payload reference or slice may outlive that reservation/consume phase.
     pub unsafe fn pszBuf_ptr(&self) -> *mut u8 {
-        self.pszBuf.as_ptr().cast::<u8>() as *mut u8
+        self.pszBuf.as_ptr()
     }
 }
 
@@ -164,21 +184,25 @@ pub fn pstInit_RingQueue(
     let buf_len = usize::try_from(ullBufLen).map_err(|_| RingQueueError::InvalidArgument)?;
     let worker_len = usize::try_from(dNumWorker).map_err(|_| RingQueueError::InvalidArgument)?;
 
-    let mut pszBuf = Vec::new();
-    pszBuf
-        .try_reserve_exact(buf_len)
-        .map_err(|_| RingQueueError::AllocationFailed)?;
-    pszBuf.extend((0..buf_len).map(|_| UnsafeCell::new(0u8)));
+    let layout = Layout::array::<u8>(buf_len).map_err(|_| RingQueueError::InvalidArgument)?;
+    // SAFETY: layout is non-zero and valid. The returned allocation is owned by
+    // st_RingQueue and deallocated with the same layout in Drop.
+    let pszBuf = NonNull::new(unsafe { alloc(layout) }).ok_or(RingQueueError::AllocationFailed)?;
 
     let mut stWorker = Vec::new();
-    stWorker
-        .try_reserve_exact(worker_len)
-        .map_err(|_| RingQueueError::AllocationFailed)?;
+    if stWorker.try_reserve_exact(worker_len).is_err() {
+        // SAFETY: worker allocation failed before ownership of pszBuf was moved
+        // into st_RingQueue, so this is the unique cleanup path.
+        unsafe {
+            dealloc(pszBuf.as_ptr(), layout);
+        }
+        return Err(RingQueueError::AllocationFailed);
+    }
     stWorker.extend((0..worker_len).map(|_| st_QueueWorker::new()));
 
     Ok(Box::new(st_RingQueue {
         ullBufLen,
-        pszBuf: pszBuf.into_boxed_slice(),
+        pszBuf,
         ullWritePos: AtomicU64::new(0),
         ullWrapLimit: UnsafeCell::new(RBUF_OFF_MAX),
         ullReadPos: AtomicU64::new(0),
@@ -196,6 +220,12 @@ pub fn pstGet_RingQueueWorker(pstRQ: &st_RingQueue, dIndex: i32) -> pst_QueueWor
     let dIndex = usize::try_from(dIndex).expect("dIndex must be non-negative");
     let pstQW = &pstRQ.stWorker[dIndex];
 
+    debug_assert_eq!(
+        pstQW.isActive.load(Ordering::Acquire),
+        0,
+        "each worker slot may be owned by only one producer at a time"
+    );
+
     // `pstQW->ullOffReady = RBUF_OFF_MAX` is an atomic assignment in C11, hence
     // sequentially consistent. Keep that property before publishing isActive.
     pstQW.ullOffReady.store(RBUF_OFF_MAX, Ordering::SeqCst);
@@ -204,7 +234,16 @@ pub fn pstGet_RingQueueWorker(pstRQ: &st_RingQueue, dIndex: i32) -> pst_QueueWor
 }
 
 pub fn Release_RingQueueWorker(pstQW: &st_QueueWorker) {
-    pstQW.isActive.store(0, Ordering::Relaxed);
+    assert_eq!(
+        pstQW.ullOffReady.load(Ordering::Acquire),
+        RBUF_OFF_MAX,
+        "a worker cannot be released with an unfinished reservation"
+    );
+
+    // Stronger than the C source's Relaxed store. If the consumer observes the
+    // inactive state and therefore skips ullOffReady, this Release/Acquire pair
+    // still publishes every payload write completed before worker release.
+    pstQW.isActive.store(0, Ordering::Release);
 }
 
 pub fn llAcquire_RingQueue(
@@ -302,7 +341,17 @@ pub fn Produce_RingQueue(pstQW: &st_QueueWorker) {
     pstQW.ullOffReady.store(RBUF_OFF_MAX, Ordering::Release);
 }
 
-pub fn llConsume_RingQueue(pstRQ: &st_RingQueue, pullWriteLen: &mut u64) -> i64 {
+/// Returns the next contiguous consumer-visible range.
+///
+/// # Safety
+///
+/// The caller must enforce the original C queue's single-consumer contract:
+/// no other thread may execute `llConsume_RingQueue` or `Release_RingQueue` for
+/// this queue concurrently, and each successful consume range must remain owned
+/// by that consumer until the matching `Release_RingQueue`. Every worker slot
+/// that may produce must already be activated before consumption starts; worker
+/// activation/reactivation must not race with the consumer.
+pub unsafe fn llConsume_RingQueue(pstRQ: &st_RingQueue, pullWriteLen: &mut u64) -> i64 {
     let mut ullReadPos = pstRQ.ullReadPos.load(Ordering::Acquire);
 
     loop {
@@ -318,7 +367,7 @@ pub fn llConsume_RingQueue(pstRQ: &st_RingQueue, pullWriteLen: &mut u64) -> i64 
         for i in 0..(pstRQ.dNumWorker as usize) {
             let pstQW = &pstRQ.stWorker[i];
 
-            if pstQW.isActive.load(Ordering::Relaxed) == 0 {
+            if pstQW.isActive.load(Ordering::Acquire) == 0 {
                 continue;
             }
 
@@ -359,7 +408,14 @@ pub fn llConsume_RingQueue(pstRQ: &st_RingQueue, pullWriteLen: &mut u64) -> i64 
     }
 }
 
-pub fn Release_RingQueue(pstRQ: &st_RingQueue, ullReaded: u64) {
+/// Advances the single consumer after it has finished reading `ullReaded` bytes.
+///
+/// # Safety
+///
+/// This must be called only by the queue's single logical consumer, for bytes
+/// returned by its preceding `llConsume_RingQueue` call, with no concurrent
+/// consumer operation on the same queue.
+pub unsafe fn Release_RingQueue(pstRQ: &st_RingQueue, ullReaded: u64) {
     let mut ullReadPos = pstRQ.ullReadPos.load(Ordering::Acquire);
 
     debug_assert!(ullReadPos <= pstRQ.ullBufLen);

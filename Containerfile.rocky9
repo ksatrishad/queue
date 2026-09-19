@@ -23,7 +23,8 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 WORKDIR /work
 COPY . /work
 
-RUN cargo check --all-targets \
-    && cargo clippy --all-targets --all-features \
+RUN cargo fmt --all -- --check \
+    && cargo check --all-targets \
+    && cargo clippy --all-targets --all-features -- -D warnings \
     && cargo test --all-targets \
     && cargo build --release

@@ -32,8 +32,8 @@ source "${HOME}/.cargo/env"
 
 rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
 rustup target add x86_64-unknown-linux-gnu --toolchain 1.98.1
-rustup default 1.98.1
 
 printf '\nRust build environment ready:\n'
-rustc --version
-cargo --version
+rustup run 1.98.1 rustc --version
+rustup run 1.98.1 cargo --version
+printf '\nFor the current interactive shell, run:\n  source "%s/.cargo/env"\n' "${HOME}"
